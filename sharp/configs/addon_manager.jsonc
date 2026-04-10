@@ -1,0 +1,10 @@
+{
+    // Create/Get your Steam API key at https://steamcommunity.com/dev/apikey 
+    "steam_api_key": "",
+    // Whether to delete local files that exist but are not included in the VPK packages.
+    "remove_obsolete_files": false,
+    // Whether to delete the downloaded addon VPKs after the download is complete
+    "remove_vpk": false,
+    // The time interval between each check (in minutes)
+    "check_interval": 5
+}

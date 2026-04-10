@@ -1,0 +1,3 @@
+[submodule "SteamApi"]
+	path = SteamApi
+	url = https://github.com/Kxnrl/SteamApi.Net
