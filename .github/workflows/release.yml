@@ -42,8 +42,8 @@ jobs:
 
       - name: Prepare Artifact
         run: |
-          mkdir -p package/sharp/plugins/AddonManager
-          cp -r publish/* package/sharp/plugins/AddonManager/
+          mkdir -p package/sharp/modules/AddonManager
+          cp -r publish/* package/sharp/modules/AddonManager/
           # If the 'sharp' config folder exists in repo root, copy it as well
           if [ -d "sharp" ]; then
             cp -r sharp/* package/sharp/
