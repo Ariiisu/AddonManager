@@ -234,19 +234,38 @@ public class AddonManager : IModSharpModule, ISteamListener, IGameListener
         if (sharedFileId != _addonId)
             return;
 
-        if (_pendingUpdateTimes.TryRemove(sharedFileId, out var newUpdateTime))
+        // Steam can fire hundreds of results for one DownloadItem (659 Success in 14 s on 24 Nov),
+        // and the engine downloads the -dual_addon item on its own. Only a download we asked for counts.
+        if (!_pendingUpdateTimes.ContainsKey(sharedFileId))
         {
-            _addonLastUpdateTimes[sharedFileId] = newUpdateTime;
+            Interlocked.Increment(ref _ignoredResults);
 
-            _logger.LogInformation("Successfully updated addon {id}. New last update time is {time}",
-                                   sharedFileId,
-                                   newUpdateTime);
+            return;
         }
 
         switch (result)
         {
             case SteamApiResult.Success:
-                HandleDownloadSuccess(sharedFileId);
+                // TryRemove picks exactly one winner among duplicate callbacks.
+                if (!_pendingUpdateTimes.TryRemove(sharedFileId, out var newUpdateTime))
+                    return;
+
+                _retryCounts.TryRemove(sharedFileId, out _);
+                _addonLastUpdateTimes[sharedFileId] = newUpdateTime;
+
+                _logger.LogInformation("Successfully updated addon {id}. New last update time is {time}",
+                                       sharedFileId,
+                                       newUpdateTime);
+
+                SaveAddonUpdateTimes();
+                Task.Run(UpdateAssetsFromPackage, _token.Token);
+
+                // The duplicate results trail in for ~15 s; report them once, after the burst.
+                Task.Delay(TimeSpan.FromSeconds(60), _token.Token)
+                    .ContinueWith(_ => _logger.LogInformation("Ignored {count} duplicate download results for addon {id}",
+                                                              Interlocked.Exchange(ref _ignoredResults, 0),
+                                                              sharedFileId),
+                                  TaskContinuationOptions.OnlyOnRanToCompletion);
 
                 break;
             case SteamApiResult.Fail:
@@ -263,26 +282,9 @@ public class AddonManager : IModSharpModule, ISteamListener, IGameListener
         }
     }
 
-    private void HandleDownloadSuccess(ulong sharedFileId)
-    {
-        if (_pendingUpdateTimes.TryRemove(sharedFileId, out var newUpdateTime))
-        {
-            _addonLastUpdateTimes[sharedFileId] = newUpdateTime;
-
-            _logger.LogInformation("Successfully updated addon {id}. New last update time is {time}",
-                                   sharedFileId,
-                                   newUpdateTime);
-        }
-
-        SaveAddonUpdateTimes();
-
-        Task.Run(UpdateAssetsFromPackage, _token.Token);
-    }
-
+    // Keeps the pending entry so the retried download's Success still passes the gate above.
     private void HandleDownloadRetry(ulong sharedFileId, SteamApiResult reason)
     {
-        _pendingUpdateTimes.TryRemove(sharedFileId, out _);
-
         var currentRetries = _retryCounts.GetValueOrDefault(sharedFileId, 0);
 
         if (currentRetries < MaxRetries)
@@ -300,8 +302,12 @@ public class AddonManager : IModSharpModule, ISteamListener, IGameListener
         {
             _logger.LogError("Failed to download addon {id} after {max} attempts. Giving up.", sharedFileId, MaxRetries);
             _retryCounts.TryRemove(sharedFileId, out _);
+            _pendingUpdateTimes.TryRemove(sharedFileId, out _);
         }
     }
+
+    private int _extracting;
+    private int _ignoredResults;
 
     private void UpdateAssetsFromPackage()
     {
@@ -310,21 +316,36 @@ public class AddonManager : IModSharpModule, ISteamListener, IGameListener
             return;
         }
 
-        HashSet<string> allPackageFilePaths;
-
-        try
+        // Single flight: one extraction of the 2 GB vpk at a time, never a queue of them.
+        if (Interlocked.Exchange(ref _extracting, 1) == 1)
         {
-            allPackageFilePaths = ExtractVpkContent();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Critical error extracting VPK: {path}", _vpkPath);
+            _logger.LogWarning("Extraction already running, skipping");
 
             return;
         }
 
-        CleanupObsoleteFiles(allPackageFilePaths);
-        CleanupSourceContent();
+        try
+        {
+            HashSet<string> allPackageFilePaths;
+
+            try
+            {
+                allPackageFilePaths = ExtractVpkContent();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Critical error extracting VPK: {path}", _vpkPath);
+
+                return;
+            }
+
+            CleanupObsoleteFiles(allPackageFilePaths);
+            CleanupSourceContent();
+        }
+        finally
+        {
+            Volatile.Write(ref _extracting, 0);
+        }
 
         _modSharp.InvokeFrameAction(RestartLevel);
     }
@@ -535,6 +556,8 @@ public class AddonManager : IModSharpModule, ISteamListener, IGameListener
                                    lastUpdateTimeLocal,
                                    localTime);
 
+            // Re-requests on every check while pending: a result can be lost across a map change at boot,
+            // and only one of the duplicate results will ever extract.
             if (lastUpdateTimeLocal > localTime)
             {
                 _logger.LogInformation("New version of {title} found. Remote: {time}. Starting download...",
